@@ -1,0 +1,91 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger: none
+
+pr:
+  branches:
+    include:
+    - main
+    - pre
+    - uat
+    - test
+
+variables:
+  - group: konnect-environment-prod
+  - name: SERVICE_URL_HOST
+    value: beta-api.terone.showroomprive.net
+  - name: SERVICE_SWAGGER_PATH
+    value: /swagger/v1/swagger.json
+  - name: SERVICE_URL_PROTOCOL
+    value: https
+  - name: AUTO_APPROVED #application auto approved for internal api only
+    value: true
+  - name: API_ACCESS
+    value: external
+
+jobs:
+- job: createPullRequestToMain
+  pool:
+    vmImage: 'ubuntu-latest'
+  steps:
+  - checkout: self
+  - task: UseNode@1
+    inputs:
+      version: '16'
+  - script: |
+      if [ "$(System.PullRequest.targetBranchName)" == "main" ]; then
+        echo "##vso[task.setvariable variable=KONNECT_CONTROL_PLANE;]$API_ACCESS"_"prod"
+      elif [ "$(System.PullRequest.targetBranchName)" == "pre" ]; then
+        echo "##vso[task.setvariable variable=KONNECT_CONTROL_PLANE;]$API_ACCESS"_"pre"
+      elif [ "$(System.PullRequest.targetBranchName)" == "uat" ]; then
+        echo "##vso[task.setvariable variable=KONNECT_CONTROL_PLANE;]$API_ACCESS"_"uat"
+      elif [ "$(System.PullRequest.targetBranchName)" == "test" ]; then
+        echo "##vso[task.setvariable variable=KONNECT_CONTROL_PLANE;]$API_ACCESS"_"test"
+      fi
+    displayName: 'Set Control Plane Variable'
+  - script: |
+      API_SPEC_FILE="swagger.json"
+      API_SWAGGER_URL=$SERVICE_URL_PROTOCOL"://"$SERVICE_URL_HOST$SERVICE_SWAGGER_PATH
+      echo "##vso[task.setvariable variable=API_SPEC_FILE;]$API_SPEC_FILE"
+      curl -sL $API_SWAGGER_URL -o $API_SPEC_FILE
+    displayName: 'Download swagger locally'
+  - script: |
+      if [ -f "/$API_SPEC_FILE" ] || ! jq -e .info.title $API_SPEC_FILE > /dev/null; then
+        echo "Error: File either does not exist or is not a valid JSON"
+        exit 1
+      fi
+    displayName: 'Check File Existence and JSON Structure'
+  - script: |
+      curl -sL https://github.com/kong/deck/releases/download/v1.29.2/deck_1.29.2_linux_amd64.tar.gz -o deck.tar.gz
+      tar -xf deck.tar.gz -C /tmp
+      sudo cp /tmp/deck /usr/local/bin/
+    displayName: 'Install Deck'
+  - script: |
+      deck file openapi2kong -o konnect.yaml -s $API_SPEC_FILE
+    displayName: 'Convert API Specification to Kong file'
+  - script: |
+      SERVICE_NAME=$(yq e '.services[].name' konnect.yaml)
+      echo "##vso[task.setvariable variable=SERVICE_NAME;]$SERVICE_NAME"
+      for yamlfile in plugins/*.yaml; do
+        deck file patch -s "$yamlfile" -o "$yamlfile" --selector '$..plugins[*]' --value 'service: "'$SERVICE_NAME'"'
+      done
+    displayName: 'Replace the service name'
+  - script: |
+      deck file patch -s konnect.yaml -o konnect.yaml --selector '.services[*]' --value 'host: "'$SERVICE_URL_HOST'"'
+      deck file patch -s konnect.yaml -o konnect.yaml --selector '.services[*]' --value 'protocol: "'$SERVICE_URL_PROTOCOL'"'
+      echo "> Starting deck diff on Control Plane:"$KONNECT_CONTROL_PLANE
+      deck gateway diff ./plugins konnect.yaml --konnect-addr "https://eu.api.konghq.com" --konnect-token $KONNECT_TOKEN --konnect-control-plane-name $KONNECT_CONTROL_PLANE --select-tag $SERVICE_NAME >> out.txt
+    displayName: 'Diff the new Kong file with Konnect'
+  - script: |
+      konnectDiff=$(cat out.txt | sed ':a;N;$!ba;s/\n/%0D%0A/g')
+      echo "##vso[task.setvariable variable=konnectDiff;]$konnectDiff"
+    displayName: 'Prepate the variable'
+
+  # Adding comment to the CreatePullRequest task
+  - task: CreatePRCommentTask@1
+    inputs:
+      AuthType: 'system'
+      Comment: $(konnectDiff)
